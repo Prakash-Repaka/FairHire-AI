@@ -33,6 +33,55 @@ class TrainRequest(BaseModel):
     ] = "random_forest"
     test_size: float = Field(default=0.2, ge=0.1, le=0.4)
     random_state: int = 42
+    async_job: bool = True
+
+
+class AuthRegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str | None = None
+    employee_id: str | None = None
+
+
+class AuthLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class UserResponse(BaseModel):
+    user_id: str
+    employee_id: str
+    email: str
+    name: str
+    role: str
+    created_at: str
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserResponse
+
+
+class JobSubmissionResponse(BaseModel):
+    job_id: str
+    kind: str
+    status: str
+    message: str
+    result: dict[str, Any] | None = None
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    kind: str
+    status: str
+    message: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class PdfReportResponse(BaseModel):
+    run_id: str
+    filename: str
 
 
 class TrainResponse(BaseModel):

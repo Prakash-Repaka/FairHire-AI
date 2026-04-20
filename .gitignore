@@ -7,3 +7,21 @@ node_modules/
 dist/
 build/
 *.log
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage/
+.venv/
+.firebase/
+backend/app/__pycache__/
+backend/data/datasets/
+backend/data/runs/
+backend/data/runs.json
+backend/data/state.json
+frontend/dist/
+frontend/.vite/
+frontend/node_modules/
+backend/__pycache__/
+adult.csv
+WhatsApp Image 2026-04-20 at 10.54.05 AM.jpeg

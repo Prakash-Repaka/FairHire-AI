@@ -5,66 +5,91 @@ import os
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
+from typing import Any
 
-import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
-from .assistant import chat as assistant_chat
-from .bias_stress_test import run_stress_test
-from .candidate_scorer import candidate_whatif, score_candidates
-from .debiasing import DebiasEngine
-from .dual_eval import run_dual_evaluation
-from .ethical_validator import validate_decisions
-from .ml_pipeline import compute_bias, compute_explainability, suggest_target_columns, train_pipeline
+from .auth import AuthenticatedUser, decode_token, hash_password, issue_token, verify_password
+from .jobs import JobManager
+from .pdf_export import build_report_pdf
+from .validation import validate_upload
 from .schemas import (
+    AuthLoginRequest,
+    AuthRegisterRequest,
+    AuthResponse,
     BiasResponse,
-    CandidateWhatIfRequest,
-    CandidateWhatIfResponse,
-    ChatRequest,
-    ChatResponse,
-    DebiasRequest,
-    DebiasResponse,
-    DualEvalRequest,
-    DualEvalResponse,
     ExplainResponse,
+    JobStatusResponse,
+    JobSubmissionResponse,
+    PdfReportResponse,
     ReportResponse,
-    ScoringRequest,
-    ScoringResponse,
-    SimulateRequest,
-    StressTestRequest,
-    StressTestResponse,
-    StressTestResultItem,
     TrainRequest,
     TrainResponse,
     UploadResponse,
-    ValidationRequest,
-    ValidationResponse,
-    WhatIfRequest,
-    WhatIfResponse,
+    UserResponse,
 )
 from .store import InMemoryStore, TrainingRun
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover - runtime fallback for Python 3.14 environments
+    pd = None
 
-# ── Paths ──────────────────────────────────────────────────────────────────
+try:
+    from .ml_pipeline import compute_bias, compute_explainability, suggest_target_columns, train_pipeline
+    ML_AVAILABLE = True
+except Exception as exc:  # noqa: BLE001
+    compute_bias = None
+    compute_explainability = None
+    suggest_target_columns = None
+    train_pipeline = None
+    ML_AVAILABLE = False
+    ML_IMPORT_ERROR = str(exc)
+
+
+ML_UNAVAILABLE_DETAIL = (
+    "ML audit features are unavailable in this runtime. Install the project dependencies on Python 3.11 or 3.12 "
+    "to enable upload, train, bias, explain, and report endpoints."
+)
+
 ROOT_DIR = Path(__file__).resolve().parents[2]
+WEB_DIR = ROOT_DIR / "frontend" / "WEB"
+MOBILE_DIR = ROOT_DIR / "MOBILE"
 DATA_DIR = ROOT_DIR / "backend" / "data"
 RUNS_JSON = DATA_DIR / "runs.json"
 
-store = InMemoryStore()
+WEB_PAGES = {
+    "landing": "landing_page",
+    "login": "login",
+    "dashboard": "dashboard_overview",
+    "upload": "upload_dataset",
+    "model-analysis": "model_analysis",
+    "bias-report": "bias_detection",
+    "explainability": "explainability_engine",
+    "reports": "audit_reports",
+    "settings": "settings",
+}
 
-# ── Application ────────────────────────────────────────────────────────────
+MOBILE_PAGES = {
+    "landing": "landing_page_mobile_v2",
+    "login": "login_mobile_v2",
+    "dashboard": "dashboard_mobile_v2",
+    "upload": "upload_mobile_v2",
+    "model-analysis": "model_analysis_mobile_v3",
+    "bias-report": "bias_detection_mobile_v2",
+    "explainability": "explainability_mobile_v2",
+    "reports": "reports_mobile_v2",
+}
+
+store = InMemoryStore()
+jobs = JobManager()
+
 app = FastAPI(
-    title="FairHire AI",
-    description=(
-        "AI-powered Fairness Audit and Decision Accountability Platform. "
-        "Dual-model evaluation, de-biasing engine, candidate scoring, ethical "
-        "validation, what-if simulation, and a conversational fairness assistant."
-    ),
-    version="3.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    title="FairHire AI Backend",
+    description="Responsible AI audit API implementing PRD/TRD requirements.",
+    version="1.0.0",
 )
 
 app.add_middleware(
@@ -76,233 +101,142 @@ app.add_middleware(
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Internal helpers
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _persist_run(run: TrainingRun, extra: dict | None = None) -> None:
+def _persist_run_summary(run: TrainingRun, bias_payload: dict | None = None, explain_payload: dict | None = None) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
     if RUNS_JSON.exists():
-        try:
-            with RUNS_JSON.open("r", encoding="utf-8") as f:
-                records = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            records = []
+        with RUNS_JSON.open("r", encoding="utf-8") as f:
+            records = json.load(f)
 
-    idx = next((i for i, r in enumerate(records) if r.get("run_id") == run.run_id), None)
-    record: dict[str, Any] = {
+    record = {
         "run_id": run.run_id,
         "dataset_id": run.dataset_id,
         "model_type": run.model_type,
         "target_column": run.target_column,
         "created_at": run.created_at.isoformat(),
         "metrics": run.metrics,
-        **(extra or {}),
+        "bias": bias_payload,
+        "explain": explain_payload,
     }
-    if idx is not None:
-        records[idx] = {**records[idx], **record}
-    else:
-        records.append(record)
+    records.append(record)
 
     with RUNS_JSON.open("w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, default=str)
+        json.dump(records, f, indent=2)
 
 
-def _read_uploaded_file(upload: UploadFile, content: bytes) -> pd.DataFrame:
+def _read_uploaded_file(upload: UploadFile, content: bytes) -> Any:
+    if pd is None:
+        raise HTTPException(status_code=503, detail=ML_UNAVAILABLE_DETAIL)
+
     filename = (upload.filename or "dataset.csv").lower()
     try:
         if filename.endswith(".csv"):
             return pd.read_csv(BytesIO(content))
         if filename.endswith(".json"):
             return pd.read_json(BytesIO(content))
-        if filename.endswith((".xlsx", ".xls")):
+        if filename.endswith(".xlsx") or filename.endswith(".xls"):
             return pd.read_excel(BytesIO(content))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}") from exc
-    raise HTTPException(status_code=400, detail="Unsupported format. Use CSV, JSON, or XLSX.")
+
+    raise HTTPException(status_code=400, detail="Unsupported file format. Use CSV, JSON, or XLSX.")
 
 
-def _build_assistant_context(run_id: str | None) -> dict[str, Any]:
-    """Pull relevant audit data from the store to enrich chatbot responses."""
-    ctx: dict[str, Any] = {}
-    if not run_id:
-        return ctx
-    try:
-        run = store.get_run(run_id)
-        ctx["run_id"] = run_id
-        ctx["model_type"] = run.model_type
-        ctx["target_column"] = run.target_column
-        ctx.update(run.metrics)
-        # Enrich with cached bias/scoring if present
-        if hasattr(run, "bias_cache") and run.bias_cache:
-            ctx.update(run.bias_cache)
-        if hasattr(run, "scoring_cache") and run.scoring_cache:
-            ctx.update(run.scoring_cache)
-    except KeyError:
-        pass
-    return ctx
+def _load_page(platform_map: dict[str, str], base_dir: Path, page: str) -> FileResponse:
+    folder = platform_map.get(page)
+    if not folder:
+        raise HTTPException(status_code=404, detail=f"Page '{page}' not found")
+
+    file_path = base_dir / folder / "code.html"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Missing view file: {file_path}")
+
+    return FileResponse(str(file_path), media_type="text/html")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# System
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.get("/health", tags=["System"])
-def health() -> dict[str, str]:
-    return {"status": "ok", "version": "3.0.0", "timestamp": datetime.utcnow().isoformat()}
-
-
-@app.get("/runs", tags=["System"])
-def list_runs() -> list[dict]:
-    if not RUNS_JSON.exists():
-        return []
-    try:
-        with RUNS_JSON.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return []
+def _fallback_target_suggestions(columns: list[str]) -> list[str]:
+    preferred = ["hired", "target", "label", "outcome", "decision", "selected", "approved", "rejected"]
+    lowered = {str(col).lower(): str(col) for col in columns}
+    suggestions = [lowered[key] for key in preferred if key in lowered]
+    if suggestions:
+        return suggestions
+    if columns:
+        return [str(columns[-1])]
+    return []
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Upload
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.post("/upload", response_model=UploadResponse, tags=["Dataset"])
-async def upload_dataset(
-    file: UploadFile = File(...),
-    target_column: str | None = Form(default=None),
-) -> UploadResponse:
-    """Upload a candidate dataset (CSV / JSON / XLSX)."""
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
-    frame = _read_uploaded_file(file, content)
-    if frame.empty:
-        raise HTTPException(status_code=400, detail="Parsed dataset is empty")
-
-    dataset_id = f"ds_{uuid4().hex[:10]}"
-    frame.columns = [str(c).strip() for c in frame.columns]
-    store.put_dataset(dataset_id, frame)
-
-    suggestions = suggest_target_columns(frame)
-    if target_column and target_column in frame.columns and target_column not in suggestions:
-        suggestions = [target_column] + suggestions
-
-    preview = frame.head(8).fillna("").to_dict(orient="records")
-    schema  = {col: str(frame[col].dtype) for col in frame.columns}
-
-    return UploadResponse(
-        dataset_id=dataset_id,
-        filename=file.filename or "dataset.csv",
-        rows=int(frame.shape[0]),
-        columns=list(frame.columns),
-        target_suggestions=suggestions,
-        preview=preview,
-        schema=schema,
-        null_counts={col: int(frame[col].isna().sum()) for col in frame.columns},
+def _serialize_user(user: AuthenticatedUser) -> UserResponse:
+    created_at = user.created_at.isoformat() if hasattr(user.created_at, "isoformat") else str(user.created_at)
+    return UserResponse(
+        user_id=user.user_id,
+        employee_id=user.employee_id,
+        email=user.email,
+        name=user.name,
+        role=user.role,
+        created_at=created_at,
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# De-biasing Engine  ✨ NEW
-# ═══════════════════════════════════════════════════════════════════════════
+def _generate_user_id() -> str:
+    return f"usr_{uuid4().hex[:10]}"
 
-@app.post("/debias", response_model=DebiasResponse, tags=["De-biasing"])
-def debias_dataset(payload: DebiasRequest) -> DebiasResponse:
-    """Audit a dataset for sensitive attributes, proxy variables, and high-correlation features."""
+
+def _generate_employee_id() -> str:
+    return f"EMP-{uuid4().hex[:6].upper()}"
+
+
+def _ensure_user_identity(user_record: dict[str, object]) -> bool:
+    changed = False
+    if not user_record.get("user_id"):
+        user_record["user_id"] = _generate_user_id()
+        changed = True
+    if not user_record.get("employee_id"):
+        user_record["employee_id"] = _generate_employee_id()
+        changed = True
+    return changed
+
+
+def _current_user(authorization: str | None = Header(default=None)) -> AuthenticatedUser:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    token = authorization.removeprefix("Bearer ").strip()
     try:
-        frame = store.get_dataset(payload.dataset_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    engine = DebiasEngine(frame, payload.target_column)
-    audit  = engine.full_audit()
-
-    masked_id: str | None = None
-    masked_cols: list[str] = []
-
-    if payload.auto_mask or payload.columns_to_remove:
-        if payload.columns_to_remove:
-            masked_frame = engine.mask_columns(payload.columns_to_remove)
-            masked_cols  = payload.columns_to_remove
-        else:
-            masked_frame, masked_cols = engine.auto_mask()
-
-        masked_id = f"ds_{uuid4().hex[:10]}_masked"
-        store.put_dataset(masked_id, masked_frame)
-
-    return DebiasResponse(
-        dataset_id=payload.dataset_id,
-        masked_dataset_id=masked_id,
-        total_columns=audit["total_columns"],
-        safe_columns=audit["safe_columns"],
-        flagged_count=audit["flagged_count"],
-        sensitive_columns=audit["sensitive_columns"],
-        proxy_columns=audit["proxy_columns"],
-        correlated_columns=audit["correlated_columns"],
-        masked_columns=masked_cols,
-        risk_summary=audit["risk_summary"],
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Dual Evaluation  ✨ NEW
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.post("/dual-eval", response_model=DualEvalResponse, tags=["Dual Evaluation"])
-def dual_eval(payload: DualEvalRequest) -> DualEvalResponse:
-    """Train Model A (full data) vs Model B (bias-masked) and compare bias influence."""
-    try:
-        frame = store.get_dataset(payload.dataset_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    run_id = f"dual_{uuid4().hex[:10]}"
-    try:
-        result = run_dual_evaluation(
-            frame=frame,
-            target_column=payload.target_column,
-            model_type=payload.model_type,
-            test_size=payload.test_size,
-            random_state=payload.random_state,
-            sensitive_columns_override=payload.sensitive_columns_override,
-            dataset_id=payload.dataset_id,
-            run_id=run_id,
-        )
+        payload = decode_token(token)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-    return DualEvalResponse(
-        run_id=result.run_id,
-        dataset_id=result.dataset_id,
-        model_type=result.model_type,
-        target_column=result.target_column,
-        masked_columns=result.masked_columns,
-        model_a_accuracy=result.model_a_accuracy,
-        model_a_f1=result.model_a_f1,
-        model_a_features=result.model_a_features,
-        model_b_accuracy=result.model_b_accuracy,
-        model_b_f1=result.model_b_f1,
-        model_b_features=result.model_b_features,
-        accuracy_delta=result.accuracy_delta,
-        f1_delta=result.f1_delta,
-        ranking_divergence=result.ranking_divergence,
-        bias_influenced_fraction=result.bias_influenced_fraction,
-        verdict=result.verdict,
-        verdict_detail=result.verdict_detail,
-        per_candidate_comparison=result.per_candidate_comparison,
+    email = str(payload.get("sub", "")).lower()
+    user_record = store.get_user(email)
+    if not user_record:
+        raise HTTPException(status_code=401, detail="Unknown user")
+    if _ensure_user_identity(user_record):
+        store.put_user(user_record)
+    return AuthenticatedUser(
+        user_id=str(user_record["user_id"]),
+        employee_id=str(user_record["employee_id"]),
+        email=user_record["email"],
+        name=user_record["name"],
+        role=user_record.get("role", "analyst"),
+        created_at=user_record["created_at"],
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Model Training (existing, cleaned up)
-# ═══════════════════════════════════════════════════════════════════════════
+def _record_to_user(record: dict[str, object]) -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=str(record["user_id"]),
+        employee_id=str(record["employee_id"]),
+        email=str(record["email"]),
+        name=str(record["name"]),
+        role=str(record.get("role", "analyst")),
+        created_at=str(record["created_at"]),
+    )
 
-@app.post("/train", response_model=TrainResponse, tags=["Model"])
-def train_model(payload: TrainRequest) -> TrainResponse:
-    """Train a classifier on an uploaded dataset."""
+
+def _train_job(payload: TrainRequest) -> dict[str, object]:
+    if not ML_AVAILABLE or train_pipeline is None:
+        raise HTTPException(status_code=503, detail=ML_UNAVAILABLE_DETAIL)
+
     try:
         frame = store.get_dataset(payload.dataset_id)
     except KeyError as exc:
@@ -337,7 +271,6 @@ def train_model(payload: TrainRequest) -> TrainResponse:
     preview_df = artifacts.test_frame.copy()
     preview_df["prediction"] = artifacts.y_pred
     preview = preview_df.head(10).fillna("").to_dict(orient="records")
-
     response = TrainResponse(
         run_id=run_id,
         dataset_id=payload.dataset_id,
@@ -349,117 +282,201 @@ def train_model(payload: TrainRequest) -> TrainResponse:
         f1_score=artifacts.metrics["f1_score"],
         confusion_matrix=artifacts.metrics["confusion_matrix"],
         prediction_preview=preview,
-        feature_count=len(artifacts.test_frame.columns) - 1,
-        train_rows=int(frame.shape[0] - len(artifacts.test_frame)),
-        test_rows=int(len(artifacts.test_frame)),
     )
-    _persist_run(run)
-    return response
+    _persist_run_summary(run)
+    return response.model_dump()
 
 
-@app.get("/train/{run_id}", response_model=TrainResponse, tags=["Model"])
-def get_train_metrics(run_id: str) -> TrainResponse:
+def _explain_job(run_id: str, sample_size: int) -> dict[str, object]:
+    if not ML_AVAILABLE or compute_explainability is None:
+        raise HTTPException(status_code=503, detail=ML_UNAVAILABLE_DETAIL)
+
     try:
         run = store.get_run(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    preview_df = run.test_frame.copy()
-    preview_df["prediction"] = run.y_pred
-    preview = preview_df.head(10).fillna("").to_dict(orient="records")
-    origin = store.datasets.get(run.dataset_id)
-    train_rows = int(origin.shape[0] - len(run.test_frame)) if origin is not None else 0
-
-    return TrainResponse(
-        run_id=run_id,
-        dataset_id=run.dataset_id,
-        model_type=run.model_type,
-        target_column=run.target_column,
-        accuracy=run.metrics["accuracy"],
-        precision=run.metrics["precision"],
-        recall=run.metrics["recall"],
-        f1_score=run.metrics["f1_score"],
-        confusion_matrix=run.metrics["confusion_matrix"],
-        prediction_preview=preview,
-        feature_count=len(run.test_frame.columns) - 1,
-        train_rows=train_rows,
-        test_rows=int(len(run.test_frame)),
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Candidate Scoring  ✨ NEW
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.post("/candidates/score", response_model=ScoringResponse, tags=["Candidate Scoring"])
-def score_candidates_endpoint(payload: ScoringRequest) -> ScoringResponse:
-    """Score all test-set candidates with feature contribution breakdowns."""
+    feature_frame = run.test_frame.drop(columns=[run.target_column], errors="ignore")
     try:
-        run = store.get_run(payload.run_id)
+        explain = compute_explainability(run.model, feature_frame, sample_size=sample_size)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload = ExplainResponse(run_id=run_id, **explain)
+    _persist_run_summary(run, explain_payload=payload.model_dump())
+    return payload.model_dump()
+
+
+def _build_report(run_id: str, sensitive_column: str, sample_size: int) -> ReportResponse:
+    train_run = train_metrics(run_id)
+    bias = bias_metrics(run_id=run_id, sensitive_column=sensitive_column)
+    explain_payload = ExplainResponse(**_explain_job(run_id, sample_size))
+    return ReportResponse(run_id=run_id, train=train_run, bias=bias, explain=explain_payload)
+
+
+@app.post("/auth/register", response_model=AuthResponse)
+def register_user(payload: AuthRegisterRequest) -> AuthResponse:
+    email = payload.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email address is required")
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long")
+    if store.get_user(email):
+        raise HTTPException(status_code=409, detail="User already exists")
+
+    now = datetime.utcnow().isoformat()
+    password_material = hash_password(payload.password)
+    user_record = {
+        "user_id": _generate_user_id(),
+        "employee_id": payload.employee_id.strip() if payload.employee_id else _generate_employee_id(),
+        "email": email,
+        "name": payload.name.strip() if payload.name else email.split("@", 1)[0],
+        "role": "analyst",
+        "created_at": now,
+        "password_salt": password_material["salt"],
+        "password_hash": password_material["hash"],
+    }
+    store.put_user(user_record)
+    user = _record_to_user(user_record)
+    return AuthResponse(token=issue_token(email), user=_serialize_user(user))
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login_user(payload: AuthLoginRequest) -> AuthResponse:
+    email = payload.email.strip().lower()
+    user_record = store.get_user(email)
+    if not user_record:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not verify_password(payload.password, str(user_record["password_salt"]), str(user_record["password_hash"])):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if _ensure_user_identity(user_record):
+        store.put_user(user_record)
+    return AuthResponse(token=issue_token(email), user=_serialize_user(_record_to_user(user_record)))
+
+
+@app.get("/auth/me", response_model=UserResponse)
+def get_current_user(user: AuthenticatedUser = Depends(_current_user)) -> UserResponse:
+    return _serialize_user(user)
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+def get_job_status(job_id: str) -> JobStatusResponse:
+    try:
+        job = jobs.get(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    try:
-        result = score_candidates(
-            model=run.model,
-            test_frame=run.test_frame,
-            target_column=run.target_column,
-            run_id=payload.run_id,
-            threshold_recommend=payload.threshold_recommend,
-            threshold_borderline=payload.threshold_borderline,
-            fairness_penalty_columns=payload.fairness_penalty_columns or [],
-            penalty_weight=payload.penalty_weight,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    # Cache scoring result on the run object for the assistant
-    run.tags.append("scored")
-
-    return ScoringResponse(
-        run_id=result.run_id,
-        total_candidates=result.total_candidates,
-        recommended=result.recommended,
-        borderline=result.borderline,
-        not_recommended=result.not_recommended,
-        candidate_scores=result.candidate_scores,
-        ranking=result.ranking,
-        fairness_adjusted_ranking=result.fairness_adjusted_ranking,
+    return JobStatusResponse(
+        job_id=job.job_id,
+        kind=job.kind,
+        status=job.status,
+        message=job.message,
+        result=job.result,
+        error=job.error,
     )
 
 
-# ── Candidate-level What-If  ✨ NEW ─────────────────────────────────────────
-
-@app.post("/candidates/whatif", response_model=CandidateWhatIfResponse, tags=["Candidate Scoring"])
-def candidate_whatif_endpoint(payload: CandidateWhatIfRequest) -> CandidateWhatIfResponse:
-    """Re-score a single candidate after overriding feature values."""
+@app.get("/report/pdf")
+def download_report_pdf(run_id: str, sensitive_column: str = "gender", sample_size: int = 40) -> Response:
+    report = _build_report(run_id, sensitive_column, sample_size)
     try:
-        run = store.get_run(payload.run_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        pdf_bytes = build_report_pdf(report.model_dump())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    try:
-        result = candidate_whatif(
-            model=run.model,
-            test_frame=run.test_frame,
-            target_column=run.target_column,
-            candidate_index=payload.candidate_index,
-            feature_overrides=payload.feature_overrides,
-            run_id=payload.run_id,
+    filename = f"fairhire-report-{run_id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def root() -> str:
+    web_links = "".join([f'<li><a href="/web/{slug}">{slug}</a></li>' for slug in WEB_PAGES])
+    mobile_links = "".join([f'<li><a href="/mobile/{slug}">{slug}</a></li>' for slug in MOBILE_PAGES])
+    return f"""
+    <html>
+      <head><title>FairHire AI Launcher</title></head>
+      <body style=\"font-family: Inter, sans-serif; padding: 24px;\">
+        <h1>FairHire AI Full-Stack Application</h1>
+        <p>Backend docs: <a href=\"/docs\">/docs</a></p>
+        <h2>Web Screens</h2>
+        <ul>{web_links}</ul>
+        <h2>Mobile Screens</h2>
+        <ul>{mobile_links}</ul>
+      </body>
+    </html>
+    """
+
+
+@app.get("/web/{page}")
+def web_page(page: str) -> FileResponse:
+    return _load_page(WEB_PAGES, WEB_DIR, page)
+
+
+@app.get("/mobile/{page}")
+def mobile_page(page: str) -> FileResponse:
+    return _load_page(MOBILE_PAGES, MOBILE_DIR, page)
+
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_dataset(file: UploadFile = File(...), target_column: str | None = Form(default=None)) -> UploadResponse:
+    if pd is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Dataset upload requires pandas in this runtime. Install dependencies or use Python 3.11/3.12.",
         )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return CandidateWhatIfResponse(**result)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    validate_upload(file, content)
+
+    frame = _read_uploaded_file(file, content)
+    if frame.empty:
+        raise HTTPException(status_code=400, detail="Parsed dataset is empty")
+
+    dataset_id = f"ds_{uuid4().hex[:10]}"
+    frame.columns = [str(c).strip() for c in frame.columns]
+    store.put_dataset(dataset_id, frame, metadata={"filename": file.filename or "dataset.csv"})
+
+    suggestions = suggest_target_columns(frame) if suggest_target_columns is not None else _fallback_target_suggestions(list(frame.columns))
+    if target_column and target_column in frame.columns and target_column not in suggestions:
+        suggestions = [target_column] + suggestions
+
+    preview = frame.head(8).fillna("").to_dict(orient="records")
+    return UploadResponse(
+        dataset_id=dataset_id,
+        filename=file.filename or "dataset.csv",
+        rows=int(frame.shape[0]),
+        columns=list(frame.columns),
+        target_suggestions=suggestions,
+        preview=preview,
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Bias / Fairness (existing, kept intact)
-# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/train", response_model=JobSubmissionResponse)
+def train_model(payload: TrainRequest) -> JobSubmissionResponse:
+    if payload.async_job:
+        job = jobs.submit("train", _train_job, payload)
+        return JobSubmissionResponse(job_id=job.job_id, kind=job.kind, status=job.status, message="Training queued")
 
-@app.get("/bias", response_model=BiasResponse, tags=["Fairness"])
+    response = _train_job(payload)
+    return JobSubmissionResponse(job_id=f"train_{uuid4().hex[:10]}", kind="train", status="completed", message="Training completed", result=response)
+
+
+@app.get("/bias", response_model=BiasResponse)
 def bias_metrics(run_id: str, sensitive_column: str = "gender") -> BiasResponse:
-    """Compute fairness / bias metrics for a training run."""
+    if not ML_AVAILABLE or compute_bias is None:
+        raise HTTPException(status_code=503, detail=ML_UNAVAILABLE_DETAIL)
+
     try:
         run = store.get_run(run_id)
     except KeyError as exc:
@@ -475,28 +492,6 @@ def bias_metrics(run_id: str, sensitive_column: str = "gender") -> BiasResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    dpd = bias["demographic_parity_difference"]
-    fi  = bias["fairness_index"]
-    eo  = bias["equal_opportunity_difference"]
-
-    if fi >= 0.85 and dpd <= 0.08:
-        verdict, verdict_detail = "PASS", "Model meets EEOC-aligned fairness thresholds."
-    elif fi >= 0.70:
-        verdict, verdict_detail = "REVIEW", "Moderate disparity detected. Manual review recommended."
-    else:
-        verdict, verdict_detail = "FAIL", "Significant bias detected. Remediation required before deployment."
-
-    recommendations: list[str] = []
-    if dpd > 0.1:
-        recommendations.append("Reweight training data to balance group representation.")
-    if eo > 0.1:
-        recommendations.append("Apply equalized odds post-processing to close the TPR gap.")
-    sr_vals = list(bias.get("selection_rate_by_group", {}).values())
-    if sr_vals and max(sr_vals) - min(sr_vals) > 0.12:
-        recommendations.append("Review referral sources — possible proxy variable for protected class.")
-    if not recommendations:
-        recommendations.append("Continue monitoring fairness metrics after each retraining cycle.")
-
     payload = BiasResponse(
         run_id=run_id,
         sensitive_column=bias["sensitive_column"],
@@ -505,246 +500,49 @@ def bias_metrics(run_id: str, sensitive_column: str = "gender") -> BiasResponse:
         selection_rate_by_group=bias["selection_rate_by_group"],
         true_positive_rate_by_group=bias["true_positive_rate_by_group"],
         fairness_index=bias["fairness_index"],
-        verdict=verdict,
-        verdict_detail=verdict_detail,
-        recommendations=recommendations,
     )
-    _persist_run(run, {"bias": payload.model_dump()})
+    _persist_run_summary(run, bias_payload=payload.model_dump())
     return payload
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Explainability (existing)
-# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/explain", response_model=JobSubmissionResponse)
+def explain_metrics(run_id: str, sample_size: int = 40, async_job: bool = True) -> JobSubmissionResponse:
+    if async_job:
+        job = jobs.submit("explain", _explain_job, run_id, sample_size)
+        return JobSubmissionResponse(job_id=job.job_id, kind=job.kind, status=job.status, message="Explainability queued")
 
-@app.get("/explain", response_model=ExplainResponse, tags=["Explainability"])
-def explain_metrics(run_id: str, sample_size: int = 40) -> ExplainResponse:
+    response = _explain_job(run_id, sample_size)
+    return JobSubmissionResponse(job_id=f"explain_{uuid4().hex[:10]}", kind="explain", status="completed", message="Explainability completed", result=response)
+
+
+@app.get("/report", response_model=ReportResponse)
+def report(run_id: str, sensitive_column: str = "gender", sample_size: int = 40) -> ReportResponse:
+    if not ML_AVAILABLE:
+        raise HTTPException(status_code=503, detail=ML_UNAVAILABLE_DETAIL)
+
+    return _build_report(run_id, sensitive_column, sample_size)
+
+
+@app.get("/train/{run_id}", response_model=TrainResponse)
+def train_metrics(run_id: str) -> TrainResponse:
     try:
         run = store.get_run(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    feature_frame = run.test_frame.drop(columns=[run.target_column], errors="ignore")
-    try:
-        explain = compute_explainability(run.model, feature_frame, sample_size=sample_size)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    preview_df = run.test_frame.copy()
+    preview_df["prediction"] = run.y_pred
+    preview = preview_df.head(10).fillna("").to_dict(orient="records")
 
-    payload = ExplainResponse(run_id=run_id, **explain)
-    _persist_run(run, {"explain": payload.model_dump()})
-    return payload
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Ethical Decision Validator  ✨ NEW
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.post("/validate", response_model=ValidationResponse, tags=["Ethical Validator"])
-def validate_decisions_endpoint(payload: ValidationRequest) -> ValidationResponse:
-    """Classify each hiring decision as Fair, Needs Review, or Biased."""
-    try:
-        run = store.get_run(payload.run_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    # First compute scores
-    try:
-        scoring = score_candidates(
-            model=run.model,
-            test_frame=run.test_frame,
-            target_column=run.target_column,
-            run_id=payload.run_id,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Scoring failed: {exc}") from exc
-
-    # Pull bias data if available
-    sr_by_group: dict[str, float] | None = None
-    if payload.sensitive_column:
-        try:
-            bias_data = compute_bias(
-                test_frame=run.test_frame,
-                y_true=run.y_true,
-                y_pred=run.y_pred,
-                sensitive_column=payload.sensitive_column,
-            )
-            sr_by_group = bias_data.get("selection_rate_by_group")
-        except Exception:  # noqa: BLE001
-            pass
-
-    report = validate_decisions(
-        candidate_scores=scoring.candidate_scores,
-        test_frame=run.test_frame,
-        sensitive_column=payload.sensitive_column,
-        selection_rate_by_group=sr_by_group,
-        run_id=payload.run_id,
+    return TrainResponse(
+        run_id=run_id,
+        dataset_id=run.dataset_id,
+        model_type=run.model_type,
+        target_column=run.target_column,
+        accuracy=run.metrics["accuracy"],
+        precision=run.metrics["precision"],
+        recall=run.metrics["recall"],
+        f1_score=run.metrics["f1_score"],
+        confusion_matrix=run.metrics["confusion_matrix"],
+        prediction_preview=preview,
     )
-
-    return ValidationResponse(
-        run_id=report.run_id,
-        total_decisions=report.total_decisions,
-        fair_count=report.fair_count,
-        needs_review_count=report.needs_review_count,
-        biased_count=report.biased_count,
-        bias_rate=report.bias_rate,
-        validated_decisions=report.validated_decisions,
-        group_disparities=report.group_disparities,
-        statistically_significant_patterns=report.statistically_significant_patterns,
-        overall_assessment=report.overall_assessment,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Full Report (existing, enhanced)
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.get("/report", response_model=ReportResponse, tags=["Reports"])
-def full_report(run_id: str, sensitive_column: str = "gender", sample_size: int = 40) -> ReportResponse:
-    """Consolidated audit report combining training, bias, and explainability."""
-    train   = get_train_metrics(run_id)
-    bias    = bias_metrics(run_id=run_id, sensitive_column=sensitive_column)
-    explain = explain_metrics(run_id=run_id, sample_size=sample_size)
-
-    generated_at = datetime.utcnow().isoformat()
-    top_feat = explain.top_global_features[0]["feature"] if explain.top_global_features else "N/A"
-    executive_summary = (
-        f"Model achieved {train.accuracy:.1%} accuracy. "
-        f"Fairness verdict: {bias.verdict}. "
-        f"Top influential feature: {top_feat}. "
-        f"Report generated: {generated_at}."
-    )
-    return ReportResponse(
-        run_id=run_id, train=train, bias=bias, explain=explain,
-        generated_at=generated_at, executive_summary=executive_summary,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# What-If Simulation (aggregate level — existing)
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.post("/simulate/whatif", response_model=WhatIfResponse, tags=["Simulation"])
-def whatif_simulate(payload: WhatIfRequest) -> WhatIfResponse:
-    fi  = payload.base_fairness_index
-    pg  = payload.base_parity_gap
-    thr = payload.threshold
-    rw  = payload.reweight_strength
-
-    thr_delta = (thr - 0.5) * 0.14
-    rw_delta  = rw * 0.18 * (1 - fi)
-    sim_fi    = min(0.97, max(0.40, fi + rw_delta - abs(thr_delta) * 0.3))
-    sim_pg    = max(0.01, pg - thr_delta * 0.09 - rw * 0.12)
-    improvement = sim_fi - fi
-    verdict = "Improved" if improvement > 0.02 else "Marginal change" if improvement > -0.01 else "Degraded"
-
-    return WhatIfResponse(
-        threshold=thr, reweight_strength=rw,
-        simulated_fairness_index=round(sim_fi, 4),
-        simulated_parity_gap=round(sim_pg, 4),
-        improvement=round(improvement, 4),
-        verdict=verdict,
-    )
-
-
-@app.post("/simulate/batch", response_model=list[WhatIfResponse], tags=["Simulation"])
-def batch_simulate(payload: SimulateRequest) -> list[WhatIfResponse]:
-    results = []
-    for thr in payload.thresholds:
-        for rw in payload.reweight_values:
-            results.append(whatif_simulate(WhatIfRequest(
-                base_fairness_index=payload.base_fairness_index,
-                base_parity_gap=payload.base_parity_gap,
-                threshold=thr, reweight_strength=rw,
-            )))
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Sample Dataset Download  ✨ NEW
-# ═══════════════════════════════════════════════════════════════════════════
-
-from fastapi.responses import FileResponse
-
-@app.get("/sample-dataset", tags=["Dataset"])
-def download_sample_dataset() -> FileResponse:
-    """Download the built-in sample hiring dataset (200 rows)."""
-    sample_path = DATA_DIR / "sample_dataset.csv"
-    if not sample_path.exists():
-        raise HTTPException(status_code=404, detail="Sample dataset not found.")
-    return FileResponse(
-        path=str(sample_path),
-        media_type="text/csv",
-        filename="fairhire_sample_dataset.csv",
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Bias Stress Test  ✨ NEW
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.post("/stress-test", response_model=StressTestResponse, tags=["Bias Stress Test"])
-def stress_test_endpoint(payload: StressTestRequest) -> StressTestResponse:
-    """Inject controlled bias into the dataset and validate whether the detection pipeline catches it."""
-    try:
-        frame = store.get_dataset(payload.dataset_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    try:
-        results = run_stress_test(
-            frame=frame,
-            target_column=payload.target_column,
-            sensitive_column=payload.sensitive_column,
-            model_type=payload.model_type,
-            strategies=payload.strategies,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Stress test failed: {exc}") from exc
-
-    detected = sum(1 for r in results if r.bias_detected)
-    missed   = len(results) - detected
-
-    return StressTestResponse(
-        dataset_id=payload.dataset_id,
-        target_column=payload.target_column,
-        sensitive_column=payload.sensitive_column,
-        total_strategies=len(results),
-        detected_count=detected,
-        missed_count=missed,
-        detection_rate=round(detected / len(results), 4) if results else 0.0,
-        results=[
-            StressTestResultItem(
-                strategy=r.strategy,
-                sensitive_column=r.sensitive_column,
-                target_group=r.target_group,
-                description=r.description,
-                baseline_fairness_index=r.baseline_fairness_index,
-                baseline_dpd=r.baseline_dpd,
-                baseline_verdict=r.baseline_verdict,
-                biased_fairness_index=r.biased_fairness_index,
-                biased_dpd=r.biased_dpd,
-                biased_verdict=r.biased_verdict,
-                bias_detected=r.bias_detected,
-                detection_confidence=r.detection_confidence,
-                delta_fairness_index=r.delta_fairness_index,
-                delta_dpd=r.delta_dpd,
-                detection_summary=r.detection_summary,
-                injected_params=r.injected_params,
-            )
-            for r in results
-        ],
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Conversational Assistant  ✨ NEW
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.post("/assistant/chat", response_model=ChatResponse, tags=["Assistant"])
-def chat_endpoint(payload: ChatRequest) -> ChatResponse:
-    """Ask natural-language questions about bias, decisions, and fairness."""
-    context = _build_assistant_context(payload.run_id)
-    result  = assistant_chat(payload.question, context)
-    return ChatResponse(**result)
