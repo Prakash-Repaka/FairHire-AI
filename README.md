@@ -73,8 +73,7 @@ FairHire AI helps teams move from raw hiring data to decision-ready fairness evi
 ## Live Deployment
 
 - Web app: https://fairhire-67f38.web.app
-- Firebase console: https://console.firebase.google.com/project/fairhire-67f38/overview
-
+  
 ## Product Walkthrough (Screenshots)
 
 ### Landing
