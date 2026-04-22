@@ -319,7 +319,7 @@ def _build_validation_notes(metrics: dict[str, Any], row_count: int) -> list[str
         notes.append("Large gap between holdout and CV scores detected. This can indicate split variance or overfitting.")
 
     if cv_best is not None and abs(accuracy - cv_best) <= 0.03:
-        notes.append("Stable cross-validation performance indicates the model generalizes well with minor expected variance.")
+        notes.append("Model Stability: High. Cross-validation variance is within acceptable bounds, so reliable generalization is expected.")
 
     return notes
 

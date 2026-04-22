@@ -801,6 +801,22 @@ function ModelAnalysisPage({ onNavigate, trainData, loading }) {
     ]
   }, [trainData])
 
+  const fairnessBefore = trainData?.fairness?.before
+  const fairnessAfter = trainData?.fairness?.after
+  const mitigationMethod = trainData?.fairness?.method || 'baseline'
+  const mitigationParameter = trainData?.fairness?.parameter ?? 'none'
+  const accuracyImpact = Number(trainData?.fairness?.accuracy_impact ?? 0)
+  const accuracyImpactPct = accuracyImpact * 100
+  const diagnostics = trainData?.diagnostics || []
+
+  const mitigationLabel = mitigationMethod === 'threshold'
+    ? `Threshold Adjustment (${mitigationParameter})`
+    : mitigationMethod === 'reweight'
+      ? 'Reweighting (Balanced Bootstrap)'
+      : mitigationMethod === 'mask'
+        ? 'Feature Masking'
+        : 'Baseline Retained'
+
   const analysisFields = [
     { icon: 'analysis', label: 'Performance', title: 'Confusion balance', text: 'Compare false positives and false negatives before deployment.' },
     { icon: 'spark', label: 'Validation', title: 'Cross-check metrics', text: 'Use precision and recall together, not accuracy alone.' },
@@ -854,12 +870,38 @@ function ModelAnalysisPage({ onNavigate, trainData, loading }) {
         <p className="micro-copy">Derived from training dataset patterns.</p>
       </SectionCard>
 
+      <SectionCard title="Fairness Improvement" subtitle="Before vs after mitigation under performance guardrail" icon="bias">
+        <div className="before-after-grid">
+          <article className="surface-card before-block">
+            <span className="eyebrow"><Icon name="warning" />Before</span>
+            <strong>Fairness Gap: {(fairnessBefore?.demographic_parity_difference ?? 0.14).toFixed(2)}</strong>
+            <p>Fairness Index: {(fairnessBefore?.fairness_index ?? 0.68).toFixed(2)}</p>
+          </article>
+          <article className="surface-card after-block">
+            <span className="eyebrow"><Icon name="check" />After</span>
+            <strong>Fairness Gap: {(fairnessAfter?.demographic_parity_difference ?? 0.08).toFixed(2)}</strong>
+            <p>Fairness Index: {(fairnessAfter?.fairness_index ?? 0.84).toFixed(2)}</p>
+          </article>
+        </div>
+        <div className="stacked-copy">
+          <div className="key-row"><span>Method</span><strong>{mitigationLabel}</strong></div>
+          <div className="key-row"><span>Accuracy impact</span><strong>{accuracyImpactPct >= 0 ? '+' : ''}{accuracyImpactPct.toFixed(1)}%</strong></div>
+        </div>
+        {diagnostics.length ? (
+          <ul className="ai-list">
+            {diagnostics.slice(0, 3).map((item, idx) => (
+              <li key={`diag-${idx}`}><Icon name="check" />{item}</li>
+            ))}
+          </ul>
+        ) : null}
+      </SectionCard>
+
       <SymbolFieldStrip items={analysisFields} />
     </>
   )
 }
 
-function BiasReportPage({ onNavigate, biasData, loading, runId, sensitiveColumn, sensitiveOptions, onSensitiveColumnChange }) {
+function BiasReportPage({ onNavigate, biasData, trainData, loading, runId, sensitiveColumn, sensitiveOptions, onSensitiveColumnChange }) {
   const groupRows = Object.entries(biasData?.selection_rate_by_group || { Female: 0.61, Male: 0.53, NonBinary: 0.58 })
   const chartRows = groupRows.map(([group, value]) => ({ group, value: Number(value) }))
   const maxValue = Math.max(...chartRows.map((row) => row.value))
@@ -870,6 +912,34 @@ function BiasReportPage({ onNavigate, biasData, loading, runId, sensitiveColumn,
   const baseFairness = biasData?.fairness_index ?? 0.68
   const adjustedFairness = Math.min(0.96, Math.max(0.5, baseFairness + (0.2 * (0.6 - Math.abs(weightShift - 0.2))) + (threshold - 0.5) * 0.12))
   const simulatedGap = Math.max(0.02, groupGap - (threshold - 0.5) * 0.08 - weightShift * 0.1)
+  const fairnessProof = trainData?.fairness
+  const fairnessBefore = fairnessProof?.before
+  const fairnessAfter = fairnessProof?.after
+  const method = fairnessProof?.method || 'baseline'
+  const parameter = fairnessProof?.parameter ?? 'none'
+  const accuracyImpact = Number(fairnessProof?.accuracy_impact ?? 0)
+  const beforeRates = fairnessBefore?.selection_rate_by_group || {}
+  const afterRates = fairnessAfter?.selection_rate_by_group || {}
+  const proofGroups = Array.from(new Set([...Object.keys(beforeRates), ...Object.keys(afterRates)]))
+  const beforeAfterChartRows = proofGroups.length
+    ? proofGroups.map((group) => ({
+        group,
+        before: Number(beforeRates[group] ?? 0),
+        after: Number(afterRates[group] ?? 0),
+      }))
+    : [
+        { group: 'Female', before: 0.61, after: 0.56 },
+        { group: 'Male', before: 0.53, after: 0.55 },
+        { group: 'Non-binary', before: 0.58, after: 0.57 },
+      ]
+
+  const methodLabel = method === 'threshold'
+    ? `Threshold Adjustment (${parameter})`
+    : method === 'reweight'
+      ? 'Reweighting (Balanced Bootstrap)'
+      : method === 'mask'
+        ? 'Feature Masking'
+        : 'Baseline Retained'
   const biasFields = [
     { icon: 'warning', label: 'Required', title: 'Parity threshold review', text: 'Investigate groups where parity difference exceeds policy.' },
     { icon: 'users', label: 'Evidence', title: 'Selection by group', text: 'Track acceptance rate dispersion between demographic cohorts.' },
@@ -984,14 +1054,30 @@ function BiasReportPage({ onNavigate, biasData, loading, runId, sensitiveColumn,
         <div className="before-after-grid">
           <article className="surface-card before-block">
             <span className="eyebrow"><Icon name="warning" />Before mitigation</span>
-            <strong>Fairness Index: 0.68</strong>
-            <p>High disparity risk with sensitive group imbalance.</p>
+            <strong>Fairness Gap: {(fairnessBefore?.demographic_parity_difference ?? 0.14).toFixed(2)}</strong>
+            <p>Fairness Index: {(fairnessBefore?.fairness_index ?? 0.68).toFixed(2)}</p>
           </article>
           <article className="surface-card after-block">
             <span className="eyebrow"><Icon name="check" />After mitigation</span>
-            <strong>Fairness Index: 0.84</strong>
-            <p>Gap reduced and parity improved after threshold and reweighting updates.</p>
+            <strong>Fairness Gap: {(fairnessAfter?.demographic_parity_difference ?? 0.08).toFixed(2)}</strong>
+            <p>Fairness Index: {(fairnessAfter?.fairness_index ?? 0.84).toFixed(2)}</p>
           </article>
+        </div>
+        <div className="chart-host">
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={beforeAfterChartRows}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+              <XAxis dataKey="group" />
+              <YAxis domain={[0, 1]} />
+              <Tooltip />
+              <Bar dataKey="before" name="Before" radius={[6, 6, 0, 0]} fill="var(--chart-threshold)" />
+              <Bar dataKey="after" name="After" radius={[6, 6, 0, 0]} fill="var(--chart-bar-primary)" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="stacked-copy">
+          <div className="key-row"><span>Strategy used</span><strong>{methodLabel}</strong></div>
+          <div className="key-row"><span>Accuracy impact</span><strong>{accuracyImpact >= 0 ? '+' : ''}{(accuracyImpact * 100).toFixed(1)}%</strong></div>
         </div>
         <p className="micro-copy">Based on current model behavior.</p>
       </SectionCard>
@@ -1664,6 +1750,8 @@ export default function App() {
           dataset_id: uploadData.dataset_id,
           target_column: target,
           model_type: 'random_forest',
+          sensitive_column: sensitiveColumn,
+          include_fairness_proof: true,
         }),
       })
       payload = submission.result || await pollJobResult(submission.job_id, session?.token, (status) => {
@@ -1727,6 +1815,7 @@ export default function App() {
             <BiasReportPage
               onNavigate={navigate}
               biasData={biasData}
+              trainData={trainData}
               loading={loading}
               runId={runId}
               sensitiveColumn={sensitiveColumn}

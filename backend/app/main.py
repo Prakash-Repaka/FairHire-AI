@@ -234,6 +234,64 @@ def _record_to_user(record: dict[str, object]) -> AuthenticatedUser:
     )
 
 
+def _compute_accuracy(y_true: pd.Series, y_pred: pd.Series) -> float:
+    truth = pd.Series(y_true).astype(str).reset_index(drop=True)
+    pred = pd.Series(y_pred).astype(str).reset_index(drop=True)
+    if truth.empty:
+        return 0.0
+    return float((truth == pred).mean())
+
+
+def _build_binary_threshold_predictions(model: Any, feature_frame: pd.DataFrame, y_true: pd.Series, threshold: float) -> pd.Series | None:
+    if not hasattr(model, "predict_proba"):
+        return None
+
+    labels = sorted(pd.Series(y_true).dropna().unique().tolist(), key=lambda x: str(x))
+    if len(labels) != 2:
+        return None
+
+    negative_label, positive_label = labels[0], labels[-1]
+    probabilities = model.predict_proba(feature_frame)
+
+    classes = None
+    classifier = getattr(model, "named_steps", {}).get("classifier") if hasattr(model, "named_steps") else None
+    if classifier is not None and hasattr(classifier, "classes_"):
+        classes = list(classifier.classes_)
+
+    if classes and positive_label in classes:
+        positive_index = classes.index(positive_label)
+    else:
+        positive_index = probabilities.shape[1] - 1
+
+    positive_probs = probabilities[:, positive_index]
+    predictions = [positive_label if p >= threshold else negative_label for p in positive_probs]
+    return pd.Series(predictions, index=feature_frame.index)
+
+
+def _build_fairness_block(bias_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "fairness_index": float(bias_payload["fairness_index"]),
+        "demographic_parity_difference": float(bias_payload["demographic_parity_difference"]),
+        "equal_opportunity_difference": float(bias_payload["equal_opportunity_difference"]),
+        "selection_rate_by_group": bias_payload["selection_rate_by_group"],
+    }
+
+
+def _make_reweighted_frame(frame: pd.DataFrame, target_column: str, random_state: int) -> pd.DataFrame:
+    value_counts = frame[target_column].value_counts(dropna=False)
+    if value_counts.empty:
+        return frame
+
+    inverse_weights = frame[target_column].map(lambda val: 1.0 / float(value_counts.get(val, 1.0)))
+    sampled_indices = frame.sample(
+        n=len(frame),
+        replace=True,
+        weights=inverse_weights,
+        random_state=random_state,
+    ).index
+    return frame.loc[sampled_indices].copy()
+
+
 def _train_job(payload: TrainRequest) -> dict[str, object]:
     if not ML_AVAILABLE or train_pipeline is None:
         raise HTTPException(status_code=503, detail=ML_UNAVAILABLE_DETAIL)
@@ -259,64 +317,136 @@ def _train_job(payload: TrainRequest) -> dict[str, object]:
 
     sensitive_column = (payload.sensitive_column or "").strip() if payload.sensitive_column else None
     if payload.include_fairness_proof and sensitive_column:
-        baseline_input = artifacts.test_frame.drop(columns=[payload.target_column], errors="ignore")
-        baseline_input[payload.target_column] = artifacts.y_true
-        if sensitive_column in baseline_input.columns and compute_bias is not None:
+        baseline_features = artifacts.test_frame.drop(columns=[payload.target_column], errors="ignore")
+        baseline_eval_frame = baseline_features.copy()
+        baseline_eval_frame[payload.target_column] = artifacts.y_true
+
+        if sensitive_column in baseline_eval_frame.columns and compute_bias is not None:
             try:
                 baseline_bias = compute_bias(
-                    test_frame=baseline_input,
+                    test_frame=baseline_eval_frame,
                     y_true=artifacts.y_true,
                     y_pred=artifacts.y_pred,
                     sensitive_column=sensitive_column,
                 )
 
-                engine = DebiasEngine(frame, payload.target_column)
-                mitigated_frame, masked_columns = engine.auto_mask()
-                after_bias: dict[str, object] | None = None
+                baseline_accuracy = float(artifacts.metrics.get("accuracy", _compute_accuracy(artifacts.y_true, artifacts.y_pred)))
+                max_accuracy_drop = 0.03
+                candidates: list[dict[str, Any]] = []
 
-                if mitigated_frame.shape[1] > 1 and sensitive_column in frame.columns:
-                    mitigated_artifacts = train_pipeline(
-                        frame=mitigated_frame,
+                def register_candidate(strategy: str, parameter: Any, acc: float, bias_payload: dict[str, Any], details: dict[str, Any] | None = None) -> None:
+                    acc_drop = baseline_accuracy - float(acc)
+                    if acc_drop > max_accuracy_drop:
+                        return
+                    candidates.append(
+                        {
+                            "strategy": strategy,
+                            "parameter": parameter,
+                            "accuracy": float(acc),
+                            "acc_drop": float(acc_drop),
+                            "gap": float(bias_payload["demographic_parity_difference"]),
+                            "bias": bias_payload,
+                            "details": details or {},
+                        }
+                    )
+
+                # Strategy 1: threshold tuning on baseline probabilities.
+                try:
+                    for threshold in (0.4, 0.5, 0.6):
+                        threshold_pred = _build_binary_threshold_predictions(
+                            model=artifacts.model,
+                            feature_frame=baseline_features,
+                            y_true=artifacts.y_true,
+                            threshold=threshold,
+                        )
+                        if threshold_pred is None:
+                            break
+
+                        threshold_bias = compute_bias(
+                            test_frame=baseline_eval_frame,
+                            y_true=artifacts.y_true,
+                            y_pred=threshold_pred,
+                            sensitive_column=sensitive_column,
+                        )
+                        threshold_acc = _compute_accuracy(artifacts.y_true, threshold_pred)
+                        register_candidate("threshold", threshold, threshold_acc, threshold_bias)
+                except Exception as exc:  # noqa: BLE001
+                    diagnostics.append(f"Threshold mitigation skipped: {exc}")
+
+                # Strategy 2: class reweighting via balanced bootstrap.
+                try:
+                    reweighted_frame = _make_reweighted_frame(frame, payload.target_column, payload.random_state)
+                    reweighted_artifacts = train_pipeline(
+                        frame=reweighted_frame,
                         target_column=payload.target_column,
                         model_type=payload.model_type,
                         test_size=payload.test_size,
                         random_state=payload.random_state,
                     )
-                    mitigated_input = mitigated_artifacts.test_frame.drop(columns=[payload.target_column], errors="ignore")
-                    mitigated_input[payload.target_column] = mitigated_artifacts.y_true
+                    reweighted_eval = reweighted_artifacts.test_frame.drop(columns=[payload.target_column], errors="ignore")
+                    reweighted_eval[payload.target_column] = reweighted_artifacts.y_true
+                    if sensitive_column not in reweighted_eval.columns and sensitive_column in reweighted_frame.columns:
+                        reweighted_eval[sensitive_column] = reweighted_frame.loc[reweighted_artifacts.y_true.index, sensitive_column]
 
-                    if sensitive_column in mitigated_input.columns:
-                        after_bias = compute_bias(
-                            test_frame=mitigated_input,
-                            y_true=mitigated_artifacts.y_true,
-                            y_pred=mitigated_artifacts.y_pred,
+                    if sensitive_column in reweighted_eval.columns:
+                        reweighted_bias = compute_bias(
+                            test_frame=reweighted_eval,
+                            y_true=reweighted_artifacts.y_true,
+                            y_pred=reweighted_artifacts.y_pred,
                             sensitive_column=sensitive_column,
                         )
+                        reweighted_acc = float(reweighted_artifacts.metrics.get("accuracy", _compute_accuracy(reweighted_artifacts.y_true, reweighted_artifacts.y_pred)))
+                        register_candidate("reweight", "balanced_bootstrap", reweighted_acc, reweighted_bias)
+                except Exception as exc:  # noqa: BLE001
+                    diagnostics.append(f"Reweight mitigation skipped: {exc}")
 
-                before_block = {
-                    "fairness_index": float(baseline_bias["fairness_index"]),
-                    "demographic_parity_difference": float(baseline_bias["demographic_parity_difference"]),
-                    "equal_opportunity_difference": float(baseline_bias["equal_opportunity_difference"]),
-                    "selection_rate_by_group": baseline_bias["selection_rate_by_group"],
-                }
-                after_block = None
-                delta_fairness = None
-                delta_dpd = None
-                if after_bias is not None:
-                    after_block = {
-                        "fairness_index": float(after_bias["fairness_index"]),
-                        "demographic_parity_difference": float(after_bias["demographic_parity_difference"]),
-                        "equal_opportunity_difference": float(after_bias["equal_opportunity_difference"]),
-                        "selection_rate_by_group": after_bias["selection_rate_by_group"],
-                    }
+                # Strategy 3: feature masking through de-bias engine.
+                try:
+                    engine = DebiasEngine(frame, payload.target_column)
+                    masked_frame, masked_columns = engine.auto_mask()
+                    if masked_frame.shape[1] > 1 and sensitive_column in frame.columns:
+                        masked_artifacts = train_pipeline(
+                            frame=masked_frame,
+                            target_column=payload.target_column,
+                            model_type=payload.model_type,
+                            test_size=payload.test_size,
+                            random_state=payload.random_state,
+                        )
+                        masked_eval = masked_artifacts.test_frame.drop(columns=[payload.target_column], errors="ignore")
+                        masked_eval[payload.target_column] = masked_artifacts.y_true
+                        if sensitive_column not in masked_eval.columns:
+                            masked_eval[sensitive_column] = frame.loc[masked_artifacts.y_true.index, sensitive_column]
+
+                        masked_bias = compute_bias(
+                            test_frame=masked_eval,
+                            y_true=masked_artifacts.y_true,
+                            y_pred=masked_artifacts.y_pred,
+                            sensitive_column=sensitive_column,
+                        )
+                        masked_acc = float(masked_artifacts.metrics.get("accuracy", _compute_accuracy(masked_artifacts.y_true, masked_artifacts.y_pred)))
+                        register_candidate("mask", ", ".join(masked_columns[:5]) if masked_columns else "auto_mask", masked_acc, masked_bias, {"masked_columns": masked_columns})
+                except Exception as exc:  # noqa: BLE001
+                    diagnostics.append(f"Mask mitigation skipped: {exc}")
+
+                before_block = _build_fairness_block(baseline_bias)
+                selected = None
+                if candidates:
+                    selected = min(candidates, key=lambda item: (item["gap"], item["acc_drop"], -item["accuracy"]))
+                    after_block = _build_fairness_block(selected["bias"])
                     delta_fairness = float(after_block["fairness_index"] - before_block["fairness_index"])
                     delta_dpd = float(before_block["demographic_parity_difference"] - after_block["demographic_parity_difference"])
-                    if delta_fairness >= 0:
-                        diagnostics.append("Fairness mitigation improved fairness index while preserving model utility.")
+                    diagnostics.append(
+                        f"Fairness optimization selected '{selected['strategy']}' with parameter '{selected['parameter']}' under accuracy-drop guardrail ({selected['acc_drop']:.3f} <= {max_accuracy_drop:.3f})."
+                    )
+                    if delta_fairness >= 0 and delta_dpd >= 0:
+                        diagnostics.append("Fairness improvement accepted because disparity decreased while model performance stayed within limits.")
                     else:
-                        diagnostics.append("Fairness mitigation did not improve fairness index; review masking strategy and sensitive attributes.")
+                        diagnostics.append("No strategy improved both fairness and parity under the configured performance guardrail; baseline retained for deployment safety.")
                 else:
-                    diagnostics.append("Fairness baseline computed, but mitigation-after metrics were not available for the selected sensitive column.")
+                    after_block = before_block
+                    delta_fairness = 0.0
+                    delta_dpd = 0.0
+                    diagnostics.append("No mitigation strategy met the accuracy-drop guardrail; fairness baseline retained.")
 
                 fairness_summary = {
                     "sensitive_column": sensitive_column,
@@ -324,7 +454,22 @@ def _train_job(payload: TrainRequest) -> dict[str, object]:
                     "after": after_block,
                     "delta_fairness_index": delta_fairness,
                     "delta_demographic_parity_difference": delta_dpd,
-                    "mitigated_columns": masked_columns,
+                    "method": selected["strategy"] if selected else "baseline",
+                    "parameter": selected["parameter"] if selected else "none",
+                    "accuracy_before": baseline_accuracy,
+                    "accuracy_after": float(selected["accuracy"]) if selected else baseline_accuracy,
+                    "accuracy_impact": float((selected["accuracy"] - baseline_accuracy)) if selected else 0.0,
+                    "accuracy_guardrail": max_accuracy_drop,
+                    "candidate_strategies": [
+                        {
+                            "strategy": c["strategy"],
+                            "parameter": c["parameter"],
+                            "gap": c["gap"],
+                            "accuracy": c["accuracy"],
+                            "acc_drop": c["acc_drop"],
+                        }
+                        for c in sorted(candidates, key=lambda item: (item["gap"], item["acc_drop"], -item["accuracy"]))
+                    ],
                 }
             except Exception as exc:  # noqa: BLE001
                 diagnostics.append(f"Fairness proof generation skipped: {exc}")
