@@ -301,6 +301,31 @@ def _train_job(payload: TrainRequest) -> dict[str, object]:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    pre_diagnostics: list[str] = []
+    required_position = (payload.required_position or "").strip()
+    if required_position:
+        role_columns = [column for column in ("role_applied", "job_role", "position", "role") if column in frame.columns]
+        if not role_columns:
+            raise HTTPException(
+                status_code=400,
+                detail="Required position was provided, but no role column was found. Add one of: role_applied, job_role, position, role.",
+            )
+
+        role_column = role_columns[0]
+        filtered_frame = frame[
+            frame[role_column].astype(str).str.strip().str.casefold() == required_position.casefold()
+        ].copy()
+        if filtered_frame.empty:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No records found for required position '{required_position}' in column '{role_column}'.",
+            )
+
+        pre_diagnostics.append(
+            f"Training scope filtered to required position '{required_position}' using column '{role_column}' ({len(filtered_frame)} rows)."
+        )
+        frame = filtered_frame
+
     try:
         artifacts = train_pipeline(
             frame=frame,
@@ -312,7 +337,7 @@ def _train_job(payload: TrainRequest) -> dict[str, object]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    diagnostics = list(artifacts.metrics.get("diagnostics", []))
+    diagnostics = [*pre_diagnostics, *list(artifacts.metrics.get("diagnostics", []))]
     fairness_summary: dict[str, object] | None = None
 
     sensitive_column = (payload.sensitive_column or "").strip() if payload.sensitive_column else None

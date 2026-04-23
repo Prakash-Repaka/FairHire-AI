@@ -241,7 +241,7 @@ function AppShell({ active, onNavigate, actions, children, isAuthenticated, onLo
   ]
 
   const crumbs = ROUTE_META[active] || ['Workspace', 'Overview']
-  const hasBackgroundLoad = Boolean(loading?.upload || loading?.train || loading?.bias || loading?.explain || loading?.report)
+  const hasBackgroundLoad = Boolean(loading?.upload || loading?.train || loading?.bias || loading?.explain || loading?.report || loading?.exportReport)
   const loadLabel = loading?.upload
     ? 'Uploading dataset'
     : loading?.train
@@ -252,6 +252,8 @@ function AppShell({ active, onNavigate, actions, children, isAuthenticated, onLo
           ? 'Generating explainability'
           : loading?.report
             ? 'Building report'
+            : loading?.exportReport
+              ? 'Exporting report PDF'
             : ''
 
   return (
@@ -452,6 +454,72 @@ async function callApi(path, options = {}) {
     throw new Error(payload.detail || 'Request failed')
   }
   return payload
+}
+
+function isSelectedPrediction(value) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value >= 1
+
+  const normalized = String(value || '').trim().toLowerCase()
+  return ['1', 'true', 'yes', 'selected', 'approved', 'accept', 'accepted', 'hired', 'recommend', 'recommended', 'pass', 'passed'].includes(normalized)
+}
+
+function deriveSelectedCandidates(previewRows = []) {
+  return previewRows
+    .filter((row) => isSelectedPrediction(row?.prediction))
+    .map((row, index) => {
+      const candidateId = row.candidate_id || row.applicant_id || row.employee_id || row.id || `Candidate ${index + 1}`
+      const position = row.role_applied || row.job_role || row.position || row.role || 'Not specified'
+      const scoreRaw = row.score ?? row.prediction_score ?? row.probability ?? row.match_score
+      const score = scoreRaw == null || Number.isNaN(Number(scoreRaw)) ? null : Number(scoreRaw)
+
+      return {
+        id: String(candidateId),
+        position: String(position),
+        score,
+      }
+    })
+}
+
+async function downloadReportPdf({ runId, sensitiveColumn, token }) {
+  if (!API_BASE) {
+    throw new Error(API_CONFIG_ERROR)
+  }
+
+  const query = new URLSearchParams({ run_id: runId })
+  if (sensitiveColumn) {
+    query.set('sensitive_column', sensitiveColumn)
+  }
+
+  let response
+  try {
+    response = await fetch(`${API_BASE}/report/pdf?${query.toString()}`, {
+      method: 'GET',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+  } catch {
+    throw new Error(`Cannot reach backend API at ${API_BASE}. ${IS_LOCAL_HOST ? 'Make sure FastAPI is running on port 8000.' : 'Deploy backend and set VITE_API_URL.'}`)
+  }
+
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || ''
+    if (contentType.includes('application/json')) {
+      const payload = await response.json().catch(() => ({}))
+      throw new Error(payload.detail || 'Failed to export report')
+    }
+    throw new Error('Failed to export report')
+  }
+
+  const blob = await response.blob()
+  const fileName = `fairhire-report-${runId}.pdf`
+  const url = window.URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = fileName
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.URL.revokeObjectURL(url)
 }
 
 async function pollJobResult(jobId, token, onUpdate) {
@@ -700,6 +768,8 @@ function UploadPage({
   onTrain,
   selectedTarget,
   setSelectedTarget,
+  requiredPosition,
+  setRequiredPosition,
 }) {
   const inputRef = useRef(null)
   const uploadFields = [
@@ -749,6 +819,15 @@ function UploadPage({
                   ))}
                 </select>
               </label>
+              <label className="target-select-label">
+                Required position for hiring
+                <input
+                  type="text"
+                  value={requiredPosition}
+                  onChange={(event) => setRequiredPosition(event.target.value)}
+                  placeholder="e.g. Data Scientist"
+                />
+              </label>
               <div className="table-scroll">
                 <table className="table-mock">
                   <thead>
@@ -779,7 +858,7 @@ function UploadPage({
           className="primary-button"
           icon="analysis"
           onClick={onTrain}
-          disabled={!uploadData || loading.train}
+          disabled={!uploadData || loading.train || !requiredPosition.trim()}
         >
           {loading.train ? 'Training model...' : 'Continue to Mapping'}
         </ButtonWithIcon>
@@ -1176,7 +1255,7 @@ function ExplainabilityPage({ onNavigate, explainData, loading }) {
   )
 }
 
-function ReportsPage({ reportData, loading }) {
+function ReportsPage({ reportData, trainData, loading, onExportReport, canExport }) {
   const reportSummary = useMemo(() => {
     const verified = reportData ? 98 : 92
     const pending = reportData ? 16 : 22
@@ -1185,6 +1264,10 @@ function ReportsPage({ reportData, loading }) {
       { name: 'Pending', value: pending, color: '#f59e0b' },
     ]
   }, [reportData])
+  const selectedCandidates = useMemo(
+    () => deriveSelectedCandidates(reportData?.train?.prediction_preview || trainData?.prediction_preview || []),
+    [reportData?.train?.prediction_preview, trainData?.prediction_preview],
+  )
 
   const reportFields = [
     { icon: 'reports', label: 'Required', title: 'Versioned reports', text: 'Keep immutable snapshots for every model release cycle.' },
@@ -1226,6 +1309,17 @@ function ReportsPage({ reportData, loading }) {
             <div className="key-row"><span>Fairness index</span><strong>{(reportData?.bias?.fairness_index ?? 0.84).toFixed(2)}</strong></div>
             <div className="key-row"><span>Top feature</span><strong>{reportData?.explain?.top_global_features?.[0]?.feature || 'experience'}</strong></div>
           </div>
+          <div className="page-actions">
+            <ButtonWithIcon
+              type="button"
+              className="primary-button"
+              icon="download"
+              onClick={onExportReport}
+              disabled={!canExport || loading.exportReport}
+            >
+              {loading.exportReport ? 'Exporting...' : 'Export PDF report'}
+            </ButtonWithIcon>
+          </div>
         </SectionCard>
       </div>
 
@@ -1249,6 +1343,21 @@ function ReportsPage({ reportData, loading }) {
           </article>
         </div>
         <p className="micro-copy">Derived from training dataset patterns.</p>
+      </SectionCard>
+
+      <SectionCard title="Selected Candidates" subtitle="Candidates recommended by the trained model" icon="users">
+        {selectedCandidates.length ? (
+          <div className="stacked-copy">
+            {selectedCandidates.map((candidate) => (
+              <div key={`${candidate.id}-${candidate.position}`} className="key-row">
+                <span>{candidate.id} - {candidate.position}</span>
+                <strong>{candidate.score == null ? 'Selected' : `${(candidate.score <= 1 ? candidate.score * 100 : candidate.score).toFixed(1)}%`}</strong>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="card-copy">No selected candidates are available yet. Train the model and generate a report to populate this section.</p>
+        )}
       </SectionCard>
 
       <SymbolFieldStrip items={reportFields} />
@@ -1462,6 +1571,7 @@ export default function App() {
   const [biasError, setBiasError] = useState(null)
   const [explainError, setExplainError] = useState(null)
   const [reportError, setReportError] = useState(null)
+  const [requiredPosition, setRequiredPosition] = useState('')
   const [isSidebarCompact, setIsSidebarCompact] = useState(false)
   const [uiBooting, setUiBooting] = useState(true)
   const [routeStageClass, setRouteStageClass] = useState('entered')
@@ -1495,6 +1605,7 @@ export default function App() {
     bias: false,
     explain: false,
     report: false,
+    exportReport: false,
   })
 
   const { toasts, pushToast, dismissToast } = useToasts()
@@ -1690,6 +1801,7 @@ export default function App() {
     setExplainData(null)
     setReportData(null)
     setSensitiveColumn('gender')
+    setRequiredPosition('')
     setBiasError(null)
     setExplainError(null)
     setReportError(null)
@@ -1717,6 +1829,7 @@ export default function App() {
 
       setUploadData(payload)
       setSelectedTarget(payload.target_suggestions?.[0] || payload.columns?.[0] || '')
+      setRequiredPosition('')
       saveDatasetUpload({
         user: session?.user,
         upload: payload,
@@ -1737,6 +1850,10 @@ export default function App() {
       pushToast('error', 'No dataset', 'Upload a dataset before training.')
       return
     }
+    if (!requiredPosition.trim()) {
+      pushToast('error', 'Required position missing', 'Enter the target hiring position before training.')
+      return
+    }
 
     setLoading((prev) => ({ ...prev, train: true }))
     try {
@@ -1749,6 +1866,7 @@ export default function App() {
         body: JSON.stringify({
           dataset_id: uploadData.dataset_id,
           target_column: target,
+          required_position: requiredPosition.trim(),
           model_type: 'random_forest',
           sensitive_column: sensitiveColumn,
           include_fairness_proof: true,
@@ -1772,6 +1890,23 @@ export default function App() {
       pushToast('error', 'Training failed', error.message)
     } finally {
       setLoading((prev) => ({ ...prev, train: false }))
+    }
+  }
+
+  const handleExportReport = async () => {
+    if (!runId) {
+      pushToast('error', 'No active run', 'Train a model before exporting the report.')
+      return
+    }
+
+    setLoading((prev) => ({ ...prev, exportReport: true }))
+    try {
+      await downloadReportPdf({ runId, sensitiveColumn, token: session?.token })
+      pushToast('success', 'Report exported', `Downloaded PDF for run ${runId}.`)
+    } catch (error) {
+      pushToast('error', 'Export failed', error.message || 'Unable to export report.')
+    } finally {
+      setLoading((prev) => ({ ...prev, exportReport: false }))
     }
   }
 
@@ -1800,6 +1935,8 @@ export default function App() {
               onTrain={handleTrain}
               selectedTarget={selectedTarget}
               setSelectedTarget={setSelectedTarget}
+              requiredPosition={requiredPosition}
+              setRequiredPosition={setRequiredPosition}
             />
           </AppShell>
         )
@@ -1837,7 +1974,13 @@ export default function App() {
       case 'reports':
         return (
           <AppShell active="reports" onNavigate={navigate} isAuthenticated={isAuthenticated} onLogout={handleLogout} userProfile={userProfile} isSidebarCompact={isSidebarCompact} onToggleSidebar={() => setIsSidebarCompact((v) => !v)} loading={loading}>
-            <ReportsPage reportData={reportData} loading={loading} />
+            <ReportsPage
+              reportData={reportData}
+              trainData={trainData}
+              loading={loading}
+              onExportReport={handleExportReport}
+              canExport={Boolean(runId)}
+            />
           </AppShell>
         )
       case 'settings':
@@ -1868,6 +2011,7 @@ export default function App() {
     runId,
     sensitiveColumn,
     sensitiveOptions,
+    requiredPosition,
     themeMode,
     effectiveTheme,
   ])

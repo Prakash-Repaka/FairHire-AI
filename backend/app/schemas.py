@@ -27,6 +27,7 @@ class UploadResponse(BaseModel):
 class TrainRequest(BaseModel):
     dataset_id: str
     target_column: str
+    required_position: str | None = None
     model_type: Literal[
         "logistic_regression", "random_forest",
         "gradient_boosting", "decision_tree", "xgboost",

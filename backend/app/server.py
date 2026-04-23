@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import csv
+import json
 from datetime import datetime
+from io import StringIO
 import os
 from pathlib import Path
 from uuid import uuid4
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from .auth import AuthenticatedUser, decode_token, hash_password, issue_token, verify_password
-from .schemas import AuthLoginRequest, AuthRegisterRequest, AuthResponse, UserResponse
+from .schemas import AuthLoginRequest, AuthRegisterRequest, AuthResponse, UploadResponse, UserResponse
 from .store import InMemoryStore
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -47,6 +51,9 @@ app = FastAPI(
 )
 
 store = InMemoryStore()
+DATA_DIR = ROOT_DIR / "backend" / "data"
+DATASETS_DIR = DATA_DIR / "datasets"
+STATE_FILE = DATA_DIR / "state.json"
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,6 +144,80 @@ def _current_user(authorization: str | None = Header(default=None)) -> Authentic
     )
 
 
+def _fallback_target_suggestions(columns: list[str]) -> list[str]:
+    preferred = ["hired", "target", "label", "outcome", "decision", "selected", "approved", "rejected"]
+    lowered = {str(column).lower(): str(column) for column in columns}
+    suggestions = [lowered[key] for key in preferred if key in lowered]
+    if suggestions:
+        return suggestions
+    return [str(columns[-1])] if columns else []
+
+
+def _infer_value_type(value: Any) -> str:
+    if value is None:
+        return "string"
+    text = str(value).strip()
+    if not text:
+        return "string"
+    try:
+        int(text)
+        return "integer"
+    except ValueError:
+        pass
+    try:
+        float(text)
+        return "number"
+    except ValueError:
+        pass
+    if text.lower() in {"true", "false"}:
+        return "boolean"
+    return "string"
+
+
+def _ml_unavailable_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "ML stack unavailable in Python 3.14 runtime. Install Python 3.11/3.12 and reinstall requirements to enable train/bias/explain/report endpoints.",
+        },
+    )
+
+
+def _serialize_dataset_to_state(dataset_id: str, filename: str, rows: list[dict[str, Any]], columns: list[str]) -> None:
+    DATASETs_DIR = DATASETS_DIR
+    DATASETs_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    dataset_path = DATASETs_DIR / f"{dataset_id}.csv"
+    with dataset_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in columns})
+
+    record = {
+        "dataset_id": dataset_id,
+        "rows": int(len(rows)),
+        "columns": columns,
+        "metadata": {
+            "filename": filename,
+        },
+        "path": str(dataset_path.relative_to(DATA_DIR)),
+    }
+
+    state = {"datasets": {}, "runs": {}, "users": {}}
+    if STATE_FILE.exists():
+        try:
+            with STATE_FILE.open("r", encoding="utf-8") as file:
+                state = json.load(file)
+        except Exception:
+            state = {"datasets": {}, "runs": {}, "users": {}}
+
+    state.setdefault("datasets", {})[dataset_id] = record
+    with STATE_FILE.open("w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -171,34 +252,87 @@ def mobile_page(page: str) -> FileResponse:
     return _load_page(MOBILE_PAGES, MOBILE_DIR, page)
 
 
-@app.post("/upload")
-def upload_placeholder() -> JSONResponse:
-    return JSONResponse(
-        status_code=503,
-        content={
-            "detail": "ML stack unavailable in Python 3.14 runtime. Install Python 3.11/3.12 and reinstall requirements to enable upload/train/bias/explain/report endpoints.",
-        },
+@app.post("/upload", response_model=UploadResponse)
+async def upload_dataset(file: UploadFile = File(...), target_column: str | None = Form(default=None)) -> UploadResponse:
+    filename = (file.filename or "dataset.csv").strip() or "dataset.csv"
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    rows: list[dict[str, Any]] = []
+    columns: list[str] = []
+
+    if filename.lower().endswith(".json"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to parse JSON file: {exc}") from exc
+        if isinstance(parsed, list):
+            rows = [row for row in parsed if isinstance(row, dict)]
+        elif isinstance(parsed, dict):
+            rows = [parsed]
+        else:
+            raise HTTPException(status_code=400, detail="JSON upload must be an object or a list of objects")
+        for row in rows:
+            for key in row:
+                if key not in columns:
+                    columns.append(str(key))
+    else:
+        reader = csv.DictReader(StringIO(text))
+        columns = list(reader.fieldnames or [])
+        rows = [dict(row) for row in reader]
+        if not columns and rows:
+            columns = list(rows[0].keys())
+
+    if not columns:
+        raise HTTPException(status_code=400, detail="No columns found in uploaded file")
+
+    normalized_rows = [{column: row.get(column, "") for column in columns} for row in rows]
+    dataset_id = f"ds_{uuid4().hex[:10]}"
+    preview = normalized_rows[:8]
+    schema = {column: _infer_value_type(next((row.get(column) for row in normalized_rows if str(row.get(column, "")).strip()), "")) for column in columns}
+    null_counts = {
+        column: sum(1 for row in normalized_rows if str(row.get(column, "")).strip() == "")
+        for column in columns
+    }
+
+    _serialize_dataset_to_state(dataset_id, filename, normalized_rows, columns)
+
+    target_suggestions = _fallback_target_suggestions(columns)
+    if target_column and target_column not in target_suggestions and target_column in columns:
+        target_suggestions = [target_column, *[column for column in target_suggestions if column != target_column]]
+
+    return UploadResponse(
+        dataset_id=dataset_id,
+        filename=filename,
+        rows=len(normalized_rows),
+        columns=columns,
+        target_suggestions=target_suggestions,
+        preview=preview,
+        schema=schema,
+        null_counts=null_counts,
     )
 
 
 @app.post("/train")
 def train_placeholder() -> JSONResponse:
-    return upload_placeholder()
+    return _ml_unavailable_response()
 
 
 @app.get("/bias")
 def bias_placeholder() -> JSONResponse:
-    return upload_placeholder()
+    return _ml_unavailable_response()
 
 
 @app.get("/explain")
 def explain_placeholder() -> JSONResponse:
-    return upload_placeholder()
+    return _ml_unavailable_response()
 
 
 @app.get("/report")
 def report_placeholder() -> JSONResponse:
-    return upload_placeholder()
+    return _ml_unavailable_response()
 
 
 @app.post("/auth/register", response_model=AuthResponse)
