@@ -22,6 +22,7 @@ import {
 const ROUTES = new Set([
   'landing',
   'login',
+  'register',
   'dashboard',
   'upload',
   'model-analysis',
@@ -46,6 +47,7 @@ const ROUTE_META = {
   reports: ['Workspace', 'Reports'],
   settings: ['Workspace', 'Settings'],
   login: ['Access', 'Sign In'],
+  register: ['Access', 'Create Account'],
   landing: ['Welcome', 'Overview'],
 }
 
@@ -556,7 +558,8 @@ function LandingPage({ onNavigate }) {
         <div className="landing-links">
           <a href="#features"><LabelIcon icon="spark">Features</LabelIcon></a>
           <a href="#trust"><LabelIcon icon="shield">Trust</LabelIcon></a>
-          <a href="#/login"><LabelIcon icon="login">Login</LabelIcon></a>
+          <a href="#/login"><LabelIcon icon="login">Sign In</LabelIcon></a>
+          <a href="#/register" className="landing-cta-link"><LabelIcon icon="users">Sign Up</LabelIcon></a>
         </div>
       </header>
 
@@ -577,11 +580,64 @@ function LandingPage({ onNavigate }) {
             </ButtonWithIcon>
           </div>
         </div>
-        <div className="hero-visual surface-card">
-          <div className="hero-band" />
-          <div className="hero-band muted" />
-          <div className="hero-band teal" />
-          <div className="hero-chip"><Icon name="spark" />Real-time fairness instrumentation</div>
+        <div className="hero-visual">
+          <div className="hero-visual-inner">
+            <div className="hero-preview-header">
+              <span className="hero-preview-dot green" />
+              <span className="hero-preview-dot amber" />
+              <span className="hero-preview-dot red" />
+              <span className="hero-preview-label">Fairness Audit — Live</span>
+            </div>
+
+            <div className="hero-metric-row">
+              <div className="hero-metric-chip">
+                <span className="hero-metric-value teal">0.87</span>
+                <span className="hero-metric-name">Fairness Index</span>
+              </div>
+              <div className="hero-metric-chip">
+                <span className="hero-metric-value indigo">92.4%</span>
+                <span className="hero-metric-name">Accuracy</span>
+              </div>
+              <div className="hero-metric-chip">
+                <span className="hero-metric-value amber">Δ 0.14</span>
+                <span className="hero-metric-name">Parity Gap</span>
+              </div>
+            </div>
+
+            <div className="hero-chart-section">
+              <span className="hero-chart-label">Selection rate by group</span>
+              <div className="hero-chart-bars">
+                <div className="hero-chart-row">
+                  <span>Female</span>
+                  <div className="hero-chart-bar-wrap">
+                    <div className="hero-chart-bar-fill" style={{ width: '61%', background: 'linear-gradient(90deg,#00c9b1,#6366f1)' }} />
+                  </div>
+                  <span className="hero-bar-pct">61%</span>
+                </div>
+                <div className="hero-chart-row">
+                  <span>Male</span>
+                  <div className="hero-chart-bar-wrap">
+                    <div className="hero-chart-bar-fill" style={{ width: '53%', background: 'linear-gradient(90deg,#3b82f6,#6366f1)' }} />
+                  </div>
+                  <span className="hero-bar-pct">53%</span>
+                </div>
+                <div className="hero-chart-row">
+                  <span>NonBinary</span>
+                  <div className="hero-chart-bar-wrap">
+                    <div className="hero-chart-bar-fill" style={{ width: '58%', background: 'linear-gradient(90deg,#8b5cf6,#ec4899)' }} />
+                  </div>
+                  <span className="hero-bar-pct">58%</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="hero-status-row">
+              <span className="hero-status-chip green"><Icon name="check" />EEOC Compliant</span>
+              <span className="hero-status-chip indigo"><Icon name="shield" />Audit Ready</span>
+            </div>
+
+            <div className="hero-chip"><Icon name="spark" />Real-time fairness instrumentation</div>
+          </div>
         </div>
       </section>
 
@@ -618,32 +674,234 @@ function LoginPage({ onNavigate, onLogin, authLoading }) {
   return (
     <div className="login-page">
       <section className="login-panel login-hero surface-panel">
-        <span className="eyebrow"><Icon name="shield" />Secure access</span>
-        <h1>Enter the audit environment.</h1>
-        <p>Use a clean, compliant login surface designed for enterprise review and high-trust team access.</p>
+        <div className="login-hero-inner">
+          <div className="brand-block login-brand">
+            <div className="brand-mark" />
+            <div>
+              <strong>FairHire AI</strong>
+              <span>Ethical hiring intelligence</span>
+            </div>
+          </div>
+          <span className="eyebrow"><Icon name="shield" />Secure access</span>
+          <h1>Enter the audit environment.</h1>
+          <p>Use a clean, compliant login surface designed for enterprise review and high-trust team access.</p>
+          <div className="login-hero-features">
+            <div className="login-hero-feat"><Icon name="check" /><span>EEOC-aligned fairness checks</span></div>
+            <div className="login-hero-feat"><Icon name="shield" /><span>End-to-end encrypted sessions</span></div>
+            <div className="login-hero-feat"><Icon name="analysis" /><span>Real-time bias instrumentation</span></div>
+          </div>
+        </div>
       </section>
       <section className="login-panel surface-card login-form-shell">
         <form className="login-form" onSubmit={submit}>
           <span className="eyebrow"><Icon name="login" />Sign in</span>
-          <h2>Corporate access</h2>
+          <h2>Welcome back</h2>
+          <p className="login-sub">Don&apos;t have an account? <button type="button" className="link-btn" onClick={() => onNavigate('register')}>Create one free</button></p>
           <label>
-            Email
-            <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@company.com" />
+            Work Email
+            <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@company.com" autoComplete="email" />
             {errors.email ? <small className="field-error">{errors.email}</small> : null}
           </label>
           <label>
             Password
-            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••" />
+            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••" autoComplete="current-password" />
             {errors.password ? <small className="field-error">{errors.password}</small> : null}
           </label>
           <ButtonWithIcon type="submit" className="primary-button" icon="dashboard" disabled={authLoading}>
             {authLoading ? 'Signing in...' : 'Continue to Dashboard'}
           </ButtonWithIcon>
           <ButtonWithIcon type="button" className="secondary-button" icon="arrow-left" onClick={() => onNavigate('landing')}>
-            Back to Landing
+            Back to Home
           </ButtonWithIcon>
+        </form>
+      </section>
+    </div>
+  )
+}
 
-          <SymbolFieldStrip items={loginFields} />
+function RegisterPage({ onNavigate, onRegister, authLoading }) {
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [errors, setErrors] = useState({})
+  const [agreed, setAgreed] = useState(false)
+  const [showModal, setShowModal] = useState(null)
+
+  const submit = (event) => {
+    event.preventDefault()
+    const nextErrors = {}
+    if (name.trim().length < 2) {
+      nextErrors.name = 'Please enter your full name.'
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      nextErrors.email = 'Enter a valid work email.'
+    }
+    if (password.length < 8) {
+      nextErrors.password = 'Password must be at least 8 characters.'
+    }
+    if (password !== confirm) {
+      nextErrors.confirm = 'Passwords do not match.'
+    }
+    if (!agreed) {
+      nextErrors.agreed = 'You must accept the terms to proceed.'
+    }
+    setErrors(nextErrors)
+    if (Object.keys(nextErrors).length) return
+    onRegister({ name, email, password })
+  }
+
+  const strength = password.length === 0 ? 0 : password.length < 8 ? 1 : password.length < 12 ? 2 : 3
+  const strengthLabel = ['', 'Weak', 'Good', 'Strong'][strength]
+  const strengthClass = ['', 'strength-weak', 'strength-good', 'strength-strong'][strength]
+
+  return (
+    <div className="login-page register-page">
+      <section className="login-panel login-hero register-hero surface-panel">
+        <div className="login-hero-inner">
+          <div className="brand-block login-brand">
+            <div className="brand-mark" />
+            <div>
+              <strong>FairHire AI</strong>
+              <span>Ethical hiring intelligence</span>
+            </div>
+          </div>
+          <span className="eyebrow"><Icon name="users" />Create your account</span>
+          <h1>Join the future of fair hiring.</h1>
+          <p>Start auditing AI-driven hiring decisions with bias detection, explainability, and board-ready compliance reports.</p>
+          <div className="register-stats">
+            <div className="reg-stat"><strong>500+</strong><span>Audit runs</span></div>
+            <div className="reg-stat"><strong>98%</strong><span>Bias detection accuracy</span></div>
+            <div className="reg-stat"><strong>EEOC</strong><span>Compliant pipeline</span></div>
+          </div>
+        </div>
+      </section>
+      <section className="login-panel surface-card login-form-shell register-form-shell">
+        <form className="login-form register-form" onSubmit={submit}>
+          <span className="eyebrow"><Icon name="users" />Sign up</span>
+          <h2>Create your account</h2>
+          <p className="login-sub">Already have an account? <button type="button" className="link-btn" onClick={() => onNavigate('login')}>Sign in here</button></p>
+
+          <label>
+            Full Name
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Jane Smith"
+              autoComplete="name"
+            />
+            {errors.name ? <small className="field-error">{errors.name}</small> : null}
+          </label>
+
+          <label>
+            Work Email
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="jane@company.com"
+              autoComplete="email"
+            />
+            {errors.email ? <small className="field-error">{errors.email}</small> : null}
+          </label>
+
+          <label>
+            Password
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="At least 8 characters"
+              autoComplete="new-password"
+            />
+            {password.length > 0 && (
+              <div className="password-strength">
+                <div className={`strength-bar ${strengthClass}`}>
+                  <span style={{ width: `${(strength / 3) * 100}%` }} />
+                </div>
+                <small className={strengthClass}>{strengthLabel}</small>
+              </div>
+            )}
+            {errors.password ? <small className="field-error">{errors.password}</small> : null}
+          </label>
+
+          <label>
+            Confirm Password
+            <input
+              type="password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              placeholder="Repeat your password"
+              autoComplete="new-password"
+            />
+            {errors.confirm ? <small className="field-error">{errors.confirm}</small> : null}
+          </label>
+
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={agreed}
+              onChange={(e) => setAgreed(e.target.checked)}
+            />
+            <span>I agree to the{' '}
+              <button
+                type="button"
+                className="link-btn"
+                onClick={(e) => { e.preventDefault(); setShowModal('terms') }}
+              >Terms of Service</button>
+              {' '}and{' '}
+              <button
+                type="button"
+                className="link-btn"
+                onClick={(e) => { e.preventDefault(); setShowModal('privacy') }}
+              >Privacy Policy</button>
+            </span>
+          </label>
+          {errors.agreed ? <small className="field-error">{errors.agreed}</small> : null}
+
+          {showModal && (
+            <div className="modal-overlay" onClick={() => setShowModal(null)}>
+              <div className="modal-card surface-card" onClick={(e) => e.stopPropagation()}>
+                <div className="modal-header">
+                  <h3>{showModal === 'terms' ? 'Terms of Service' : 'Privacy Policy'}</h3>
+                  <button type="button" className="modal-close" onClick={() => setShowModal(null)}>×</button>
+                </div>
+                <div className="modal-body">
+                  {showModal === 'terms' ? (
+                    <>
+                      <p><strong>Effective Date:</strong> January 1, 2025</p>
+                      <p>By using FairHire AI, you agree to these terms. FairHire AI provides an AI-powered hiring fairness audit platform for enterprise use.</p>
+                      <p><strong>Acceptable Use:</strong> You may use FairHire AI only for lawful hiring audit purposes. You must not upload personal data without appropriate consent.</p>
+                      <p><strong>Data Ownership:</strong> All datasets you upload remain your property. We process data solely to deliver audit results.</p>
+                      <p><strong>Liability:</strong> FairHire AI is provided as-is. We are not liable for hiring decisions made using our platform.</p>
+                      <p><strong>Changes:</strong> We may update these terms at any time. Continued use constitutes acceptance.</p>
+                    </>
+                  ) : (
+                    <>
+                      <p><strong>Effective Date:</strong> January 1, 2025</p>
+                      <p>FairHire AI takes your privacy seriously. This policy describes how we collect, use, and protect your information.</p>
+                      <p><strong>Data We Collect:</strong> We collect your email, name, and any datasets you upload for audit processing.</p>
+                      <p><strong>How We Use It:</strong> Your data is used solely to run fairness audits and generate compliance reports. We do not sell your data.</p>
+                      <p><strong>Security:</strong> We use industry-standard encryption and access controls to protect your information.</p>
+                      <p><strong>Retention:</strong> You can delete your account and associated data at any time from your settings page.</p>
+                      <p><strong>Contact:</strong> For privacy concerns, contact privacy@fairhire.ai</p>
+                    </>
+                  )}
+                </div>
+                <div className="modal-footer">
+                  <button type="button" className="primary-button" onClick={() => setShowModal(null)}>I Understand</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <ButtonWithIcon type="submit" className="primary-button" icon="users" disabled={authLoading}>
+            {authLoading ? 'Creating account...' : 'Create Account'}
+          </ButtonWithIcon>
+          <ButtonWithIcon type="button" className="secondary-button" icon="arrow-left" onClick={() => onNavigate('login')}>
+            Back to Sign In
+          </ButtonWithIcon>
         </form>
       </section>
     </div>
@@ -1757,6 +2015,28 @@ export default function App() {
     loadReport()
   }, [runId, route, reportData, loading.report, session?.token, reportError])
 
+  const handleRegister = async ({ name, email, password }) => {
+    setLoading((prev) => ({ ...prev, auth: true }))
+    try {
+      const authPayload = await callApi('/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, name }),
+      })
+      setSession(authPayload)
+      upsertUserProfile(authPayload.user).catch(() => {
+        pushToast('info', 'Firestore sync', 'Account created, but profile sync to Firestore failed.')
+      })
+      pushToast('success', 'Account created', `Welcome to FairHire AI, ${authPayload.user.name || name}!`)
+      navigate('dashboard')
+      setRoute('dashboard')
+    } catch (error) {
+      pushToast('error', 'Registration failed', error.message || 'Unable to create account right now.')
+    } finally {
+      setLoading((prev) => ({ ...prev, auth: false }))
+    }
+  }
+
   const handleLogin = async ({ email, password }) => {
     setLoading((prev) => ({ ...prev, auth: true }))
     try {
@@ -1918,6 +2198,8 @@ export default function App() {
     switch (route) {
       case 'login':
         return <LoginPage onNavigate={navigate} onLogin={handleLogin} authLoading={loading.auth} />
+      case 'register':
+        return <RegisterPage onNavigate={navigate} onRegister={handleRegister} authLoading={loading.auth} />
       case 'dashboard':
         return (
           <AppShell active="dashboard" onNavigate={navigate} isAuthenticated={isAuthenticated} onLogout={handleLogout} userProfile={userProfile} isSidebarCompact={isSidebarCompact} onToggleSidebar={() => setIsSidebarCompact((v) => !v)} loading={loading}>
